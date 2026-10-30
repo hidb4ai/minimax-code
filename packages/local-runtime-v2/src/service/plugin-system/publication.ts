@@ -632,6 +632,17 @@ export class PluginMcpDiscoveryScheduler {
 
   constructor(private readonly options: PluginMcpDiscoverySchedulerOptions) {}
 
+  get isDiscovering(): boolean {
+    return Boolean(this.activeTask || this.queued);
+  }
+
+  /** Wait for active inventory work and its publication, without waiting for retry timers. */
+  async whenIdle(): Promise<void> {
+    while (this.activeTask?.operation) {
+      await this.activeTask.operation;
+    }
+  }
+
   published(
     discovery: PluginMcpDiscoveryPublication,
     publishedSnapshot: PluginSnapshot,
@@ -745,6 +756,7 @@ export class PluginMcpDiscoveryScheduler {
       return;
     }
     this.options.queue(publication);
+    await publication.completion?.promise;
   }
 
   private succeeded(snapshot: PluginSnapshot): void {

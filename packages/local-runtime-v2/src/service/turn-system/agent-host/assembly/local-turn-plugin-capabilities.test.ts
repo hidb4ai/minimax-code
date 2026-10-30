@@ -1,7 +1,19 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { setImmediate as nextEventLoopTurn } from 'node:timers/promises';
 import { buildLocalTurnToolCatalog } from './local-turn-tool-catalog.js';
 import { Type } from '@sinclair/typebox';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RuntimeTool } from '@mavis/agent-core/tools';
+import type { DatabaseLike } from '@mavis/local-runtime';
+import type { McpToolInfo } from '@mavis/mcp';
+import { migratePluginTestDatabase } from '../../../../../test/helpers/plugin-database.js';
+import { PluginSystem } from '../../../plugin-system/plugin-system.js';
+import { PluginMcpRuntime, type PluginMcpPool } from '../../../plugin-system/mcp/runtime.js';
+import { SqlitePluginRepository } from '../../../plugin-system/plugin/runtime/repository.js';
+import { AgentHostTurnCapabilityLifecycle } from './turn-capability-lifecycle.js';
 import {
   detectPluginReferencesForMessages,
   buildPluginReferenceReminder,
@@ -165,5 +177,249 @@ describe('Plugin identity selection at the final Runtime capability boundary', (
     expect(result!.length).toBeLessThan(16384);
     expect(result).toContain('omitted');
     expect(result).toContain('</system-reminder>');
+  });
+});
+
+function controlledPromise<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((accept, fail) => {
+    resolve = accept;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+const pluginInventory: McpToolInfo[] = [
+  { name: 'list_scopes', description: 'List synthetic scopes', inputSchema: { type: 'object' } },
+];
+const readinessCleanups: Array<() => Promise<void>> = [];
+
+afterEach(async () => {
+  vi.useRealTimers();
+  for (const cleanup of readinessCleanups.splice(0).reverse()) await cleanup();
+});
+
+async function pluginReadinessFixture({ mcp = true, secondHealthyServer = false } = {}) {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'plugin-turn-readiness-'));
+  const pluginRoot = path.join(dataDir, 'plugins', 'notes');
+  const manifestPath = path.join(pluginRoot, '.minimax-plugin', 'plugin.json');
+  const mcpPath = path.join(pluginRoot, 'notes.mcp.json');
+  const manifest = {
+    schemaVersion: 1,
+    name: 'notes',
+    version: '1.0.0',
+    description: 'Synthetic scope tools',
+    author: 'Test fixture',
+    icon: 'icon.png',
+    category: 'Other',
+    exampleQueries: [],
+    apps: [],
+    skills: ['skills/notes/SKILL.md'],
+    mcpServers: mcp ? ['notes.mcp.json'] : [],
+  };
+  await mkdir(path.dirname(manifestPath), { recursive: true });
+  await mkdir(path.join(pluginRoot, 'skills', 'notes'), { recursive: true });
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  await writeFile(path.join(pluginRoot, 'icon.png'), Buffer.from([0]));
+  await writeFile(path.join(pluginRoot, 'skills', 'notes', 'SKILL.md'),
+    '---\nname: notes\ndescription: Find synthetic scopes\n---\nUse the scope tools.\n');
+  const writeEndpoint = (url: string) => writeFile(mcpPath, JSON.stringify({
+    schemaVersion: 1,
+    mcpServers: {
+      notes: { type: 'streamable-http', url },
+      ...(secondHealthyServer ? { healthy: { type: 'streamable-http', url: 'http://127.0.0.1:8125/mcp' } } : {}),
+    },
+  }));
+  if (mcp) await writeEndpoint('http://127.0.0.1:8123/mcp');
+
+  const Database = createRequire(import.meta.url)('better-sqlite3') as new (filename: string) => DatabaseLike;
+  const database = new Database(':memory:');
+  const repository = new SqlitePluginRepository(migratePluginTestDatabase(database));
+  let inventory = controlledPromise<McpToolInfo[]>();
+  let discoveryStarted = controlledPromise<void>();
+  const inventories = [inventory];
+  let onChange!: () => Promise<void>;
+  const pool: PluginMcpPool = {
+    listTools: async (serverName) => {
+      if (serverName.includes('healthy')) return [{ ...pluginInventory[0]!, name: 'healthy_scopes' }];
+      discoveryStarted.resolve();
+      return inventory.promise;
+    },
+    callTool: async () => ({ content: [{ type: 'text', text: 'synthetic scope result' }] }),
+    disconnect: async () => undefined,
+    shutdown: async () => undefined,
+  };
+  const createRuntime = () => new PluginMcpRuntime({ pool });
+  const system = new PluginSystem({
+    dataDir,
+    officialCacheRoot: path.join(dataDir, 'official'),
+    repository,
+    authContextGetter: () => undefined,
+    deploymentGetter: () => 'synthetic',
+    listReservations: async () => ({ skillNames: [], mcpServerNames: [], toolNames: [] }),
+    mcpRuntime: createRuntime(),
+    mcpRuntimeFactory: createRuntime,
+    localDirectoryWatcherFactory: (changed) => {
+      onChange = changed;
+      return { start: async () => undefined, whenIdle: async () => undefined, close: () => undefined };
+    },
+  });
+  const lifecycle = new AgentHostTurnCapabilityLifecycle();
+  const publication = lifecycle.attach(system);
+  let publicationBarrier: ReturnType<typeof controlledPromise<void>> | undefined;
+  let publicationStarted = controlledPromise<void>();
+  system.attachPublicationPort({
+    get activeTurnCount() { return publication.activeTurnCount; },
+    tryPublish: (publish) => publication.tryPublish(async () => {
+      if (publicationBarrier) {
+        publicationStarted.resolve();
+        await publicationBarrier.promise;
+      }
+      await publish();
+    }),
+  });
+  const leases: Array<{ release(): boolean }> = [];
+  readinessCleanups.push(async () => {
+    inventories.forEach((pending) => pending.resolve(pluginInventory));
+    publicationBarrier?.resolve();
+    leases.forEach((lease) => lease.release());
+    await system.dispose();
+    database.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await system.initialize();
+  await system.waitUntilReady();
+  expect(system.currentSnapshot.turnCapabilities.plugins).toContainEqual(expect.objectContaining({ name: 'notes' }));
+  if (mcp) await discoveryStarted.promise;
+  return {
+    system,
+    async acquire(sessionId = 'session', signal?: AbortSignal) {
+      const lease = await lifecycle.acquire({ sessionId, turnId: `turn-${leases.length}`, signal });
+      leases.push(lease);
+      return lease;
+    },
+    finishDiscovery() { inventory.resolve(pluginInventory); },
+    failDiscovery() { inventory.reject(new Error('Synthetic inventory failure')); },
+    blockPublication() {
+      publicationBarrier = controlledPromise<void>();
+      publicationStarted = controlledPromise<void>();
+      return { started: publicationStarted.promise, release: () => publicationBarrier!.resolve() };
+    },
+    async changeEndpoint() {
+      inventory = controlledPromise<McpToolInfo[]>();
+      inventories.push(inventory);
+      discoveryStarted = controlledPromise<void>();
+      await writeEndpoint('http://127.0.0.1:8124/mcp');
+      await onChange();
+      await discoveryStarted.promise;
+    },
+    async changeDescription() {
+      await writeFile(manifestPath, JSON.stringify({ ...manifest, description: 'Updated notes' }));
+      await onChange();
+    },
+  };
+}
+
+describe('Plugin MCP readiness before the first turn capability capture', () => {
+  it('waits for cold discovery and captures callable tools on the first turn', async () => {
+    const fixture = await pluginReadinessFixture();
+    let admitted = false;
+    const pending = fixture.acquire().then((lease) => { admitted = true; return lease; });
+    await nextEventLoopTurn();
+    expect(admitted).toBe(false);
+    fixture.finishDiscovery();
+    const lease = await pending;
+    const scopeTool = lease.capabilities!.runtimeTools.find((entry) => entry.def.name.endsWith('list_scopes'));
+    expect(scopeTool).toBeDefined();
+    await expect(scopeTool!.impl.execute({ sessionId: 'session', turnId: 'turn' }, {}))
+      .resolves.toMatchObject({ text: 'synthetic scope result' });
+  });
+
+  it('does not capture a cached empty inventory between discovery and publication', async () => {
+    const fixture = await pluginReadinessFixture();
+    const publication = fixture.blockPublication();
+    let prepared = false;
+    const pending = fixture.system.prepareTurnCapabilities().then((value) => { prepared = true; return value; });
+    fixture.finishDiscovery();
+    await publication.started;
+    await nextEventLoopTurn();
+    expect(prepared).toBe(false);
+    publication.release();
+    const preparation = await pending;
+    expect(fixture.system.captureTurnCapabilities(preparation).runtimeTools.map((entry) => entry.def.name))
+      .toEqual([expect.stringMatching(/list_scopes$/u)]);
+  });
+
+  it('cancels one waiter without cancelling discovery needed by another session', async () => {
+    const fixture = await pluginReadinessFixture();
+    const controller = new AbortController();
+    const cancelled = fixture.acquire('cancelled-session', controller.signal);
+    const waiting = fixture.acquire('other-session');
+    const reason = new Error('Turn cancelled');
+    const rejected = expect(cancelled).rejects.toBe(reason);
+    controller.abort(reason);
+    await rejected;
+    fixture.finishDiscovery();
+    const lease = await waiting;
+    expect(lease.capabilities!.runtimeTools.map((entry) => entry.def.name))
+      .toEqual([expect.stringMatching(/list_scopes$/u)]);
+  });
+
+  it('keeps a healthy server available after another inventory fails without waiting for retries', async () => {
+    const fixture = await pluginReadinessFixture({ secondHealthyServer: true });
+    const pending = fixture.acquire();
+    fixture.failDiscovery();
+    const lease = await pending;
+    expect(lease.capabilities!.runtimeTools.map((entry) => entry.def.name))
+      .toEqual([expect.stringMatching(/healthy_scopes$/u)]);
+    expect(fixture.system.currentSnapshot.diagnostics)
+      .toContainEqual(expect.objectContaining({ code: 'MCP_SERVER_LIST_FAILED' }));
+  });
+
+  it('bounds an unpublished inventory wait by the turn preparation deadline', async () => {
+    const fixture = await pluginReadinessFixture();
+    const publication = fixture.blockPublication();
+    fixture.finishDiscovery();
+    await publication.started;
+    vi.useFakeTimers();
+    const pending = fixture.system.prepareTurnCapabilities();
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'MCP_INVENTORY_NOT_READY' });
+    await vi.advanceTimersByTimeAsync(20_001);
+    await rejected;
+    publication.release();
+  });
+
+  it('rejects a newly warming endpoint at final capture after preparation', async () => {
+    const fixture = await pluginReadinessFixture();
+    fixture.finishDiscovery();
+    const preparation = await fixture.system.prepareTurnCapabilities();
+    expect(fixture.system.captureTurnCapabilities(preparation).runtimeTools).toHaveLength(1);
+    await fixture.changeEndpoint();
+    expect(() => fixture.system.captureTurnCapabilities(preparation))
+      .toThrow(expect.objectContaining({ code: 'MCP_INVENTORY_NOT_READY' }));
+    fixture.finishDiscovery();
+    const lease = await fixture.acquire();
+    expect(lease.capabilities!.runtimeTools).toHaveLength(1);
+  });
+
+  it('reuses valid inventory while a previous turn retains its own generation', async () => {
+    const fixture = await pluginReadinessFixture();
+    fixture.finishDiscovery();
+    const first = await fixture.acquire();
+    await fixture.changeDescription();
+    const second = await fixture.acquire('second-session');
+    expect(second.capabilities!.runtimeTools.map((entry) => entry.def.name))
+      .toEqual(first.capabilities!.runtimeTools.map((entry) => entry.def.name));
+    expect(second.capabilities!.revision).not.toBe(first.capabilities!.revision);
+    await expect(first.capabilities!.runtimeTools[0]!.impl.execute({ sessionId: 'session', turnId: 'turn' }, {}))
+      .resolves.toMatchObject({ text: 'synthetic scope result' });
+  });
+
+  it('admits a skill-only plugin without requiring MCP discovery', async () => {
+    const fixture = await pluginReadinessFixture({ mcp: false });
+    const lease = await fixture.acquire();
+    expect(lease.capabilities!.runtimeTools).toEqual([]);
+    expect(lease.capabilities!.skills).toEqual([expect.objectContaining({ name: expect.stringContaining('notes') })]);
   });
 });
