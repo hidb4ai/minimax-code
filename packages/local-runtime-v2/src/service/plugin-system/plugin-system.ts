@@ -232,7 +232,8 @@ export class PluginSystem implements AgentHostTurnCapabilityProvider {
     this.mcpDiscovery = new PluginMcpDiscoveryScheduler({
       delaysMs: options.mcpDiscoveryDelaysMs,
       drainTimeoutMs: options.mcpDiscoveryDrainTimeoutMs,
-      prepare: (snapshot) => this.preparePublication(snapshot, {}, 'discover'),
+      prepare: (snapshot) =>
+        this.preparePublication(snapshot, { completion: deferred<void>() }, 'discover'),
       isCurrent: (expectedRevision, requestedScopeKey) =>
         !this.disposed &&
         requestedScopeKey === this.desiredScopeKey &&
@@ -274,13 +275,85 @@ export class PluginSystem implements AgentHostTurnCapabilityProvider {
 
   async prepareTurnCapabilities(signal?: AbortSignal): Promise<AgentHostTurnCapabilityPreparation> {
     this.assertUsable();
+    const deadline = new AbortController();
+    const timeout = setTimeout(() => deadline.abort(mcpInventoryNotReady()), 20_000);
+    timeout.unref?.();
+    const readinessSignal = AbortSignal.any([
+      this.disposalController.signal,
+      deadline.signal,
+      ...(signal ? [signal] : []),
+    ]);
+    try {
+      await this.waitForTurnMcpInventory(readinessSignal);
+    } catch (error) {
+      this.assertUsable();
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
     return preparePluginSystemTurnCapabilities(this.connectorRuntime, signal);
   }
 
   captureTurnCapabilities(
     preparation?: AgentHostTurnCapabilityPreparation,
   ): AgentHostTurnCapabilityView {
+    // A reload can publish a warming generation after asynchronous turn preparation.
+    this.assertTurnMcpInventoryReady();
     return capturePluginSystemTurnCapabilities(this.snapshot.turnCapabilities, preparation);
+  }
+
+  private async waitForTurnMcpInventory(signal: AbortSignal): Promise<void> {
+    for (;;) {
+      signal.throwIfAborted();
+      this.assertUsable();
+      this.captureOfficialScope();
+      const requestedScopeKey = this.desiredScopeKey;
+      const restore = this.cachedRestore;
+      if (restore?.scopeKey === requestedScopeKey) {
+        await waitForTurnReadiness(restore.operation, signal);
+      }
+      await waitForTurnReadiness(this.operationTail, signal);
+      await waitForTurnReadiness(this.localDirectoryWatcher.whenIdle(), signal);
+      if (this.snapshot.mcpServers.length || this.desiredSnapshot.mcpServers.length) {
+        if (this.turnMcpInventoryIsWarming()) {
+          await waitForTurnReadiness(this.mcpDiscovery.whenIdle(), signal);
+        }
+        if (this.publicationCompletion) {
+          await waitForTurnReadiness(this.publicationCompletion, signal);
+        }
+      }
+      signal.throwIfAborted();
+      this.captureOfficialScope();
+      if (restore !== this.cachedRestore || requestedScopeKey !== this.desiredScopeKey) continue;
+      if (this.snapshot.mcpServers.length || this.desiredSnapshot.mcpServers.length) {
+        if (
+          this.pendingPublication ||
+          this.publishing ||
+          (this.turnMcpInventoryIsWarming() && this.mcpDiscovery.isDiscovering)
+        ) {
+          continue;
+        }
+      }
+      this.assertTurnMcpInventoryReady();
+      return;
+    }
+  }
+
+  private assertTurnMcpInventoryReady(): void {
+    this.assertUsable();
+    if (!this.snapshot.mcpServers.length && !this.desiredSnapshot.mcpServers.length) return;
+    if (
+      this.desiredSnapshot !== this.snapshot ||
+      this.pendingPublication ||
+      this.publishing ||
+      this.turnMcpInventoryIsWarming()
+    ) {
+      throw mcpInventoryNotReady();
+    }
+  }
+
+  private turnMcpInventoryIsWarming(): boolean {
+    return this.snapshot.diagnostics.some(({ code }) => code === 'MCP_SERVER_WARMING');
   }
 
   retainTurnCapabilities(capabilities: AgentHostTurnCapabilityView): void {
@@ -1196,5 +1269,29 @@ export class PluginSystem implements AgentHostTurnCapabilityProvider {
 
   assertUsable(): void {
     if (this.disposed) throw new PluginSystemError('DISPOSED', 'PluginSystem is disposed');
+  }
+}
+
+function mcpInventoryNotReady(): PluginSystemError {
+  return new PluginSystemError(
+    'MCP_INVENTORY_NOT_READY',
+    'Plugin MCP tool inventory is not ready; retry after discovery completes.',
+  );
+}
+
+/** Cancel only this admission wait; discovery is shared by other turns. */
+async function waitForTurnReadiness(operation: Promise<void>, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  let aborted: (() => void) | undefined;
+  try {
+    await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        aborted = () => reject(signal.reason);
+        signal.addEventListener('abort', aborted, { once: true });
+      }),
+    ]);
+  } finally {
+    if (aborted) signal.removeEventListener('abort', aborted);
   }
 }
